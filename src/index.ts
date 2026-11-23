@@ -40,6 +40,7 @@ import { launchExternal } from './open-external.ts'
 import { createArchiveTasks, respondArchiveDownload, type ArchiveTasks } from './archive-route.ts'
 import * as git from './git.ts'
 import { gitGraph, gitHistory, type GitGraphOptions, type GitHistoryOptions } from './git-graph.ts'
+import { readIdeaChangeLists, moveIdeaChangeListFiles } from './idea-changelists.ts'
 import { SettingsConflictError } from '@deepseek-ai/dsh-settings'
 import { AgentOpenRegistry, registerOpenTool, type AgentOpenRequest } from './agent-opens.ts'
 import { buildSubagentLiveApi, type SidebarSubagentLiveRoutes } from './subagent-live-route.ts'
@@ -950,6 +951,46 @@ function buildApi(
     'git.status': async (payload) => {
       const { cwd } = await gitCwdOf(payload)
       return git.status(cwd, selectedRepoOf(payload))
+    },
+    // The Git lens's IDEA grouping: change lists live in the WORKSPACE's
+    // `.idea/workspace.xml`, not in the selected checkout, so this reads the
+    // session root (`cwdOf`) rather than the worktree-selected `gitCwdOf`.
+    // A non-IDEA workspace answers `isIdeaProject: false`; every other failure
+    // degrades to an empty list set (the lens then keeps its plain groups).
+    'git.changelists': async (payload) => {
+      const { cwd } = await cwdOf(payload)
+      return readIdeaChangeLists(cwd)
+    },
+    // Drag one file — or a directory's whole visible subtree — between the
+    // workspace's IDEA change lists. This is the ONE route of the lens that
+    // edits IDE configuration, and it is an explicit user action: the host
+    // re-reads workspace.xml, moves the `<change>` rows in ONE edit, verifies
+    // the result and writes atomically (a failed write restores the previous
+    // bytes or falls back to an in-place write).
+    'git.changelists.move': async (payload) => {
+      const { cwd } = await cwdOf(payload)
+      const record = payload as { files?: unknown; expectedMtimeMs?: unknown } | null
+      const rawFiles = Array.isArray(record?.files) ? record.files : []
+      if (rawFiles.length === 0) throw new SidebarError('bad-request', 'files must be a non-empty array')
+      const files: Array<{ path: string; status?: 'new' | 'deleted' | 'modified' }> = rawFiles.map((value) => {
+        const file = value as { status?: unknown } | null
+        const status = file?.status === 'new' || file?.status === 'deleted' || file?.status === 'modified'
+          ? file.status
+          : undefined
+        return {
+          path: requireAbsolute(requireString(value, 'path')),
+          ...(status === undefined ? {} : { status }),
+        }
+      })
+      const expectedMtimeMs = typeof record?.expectedMtimeMs === 'number' && Number.isFinite(record.expectedMtimeMs)
+        ? record.expectedMtimeMs
+        : undefined
+      return moveIdeaChangeListFiles(cwd, {
+        from: requireString(payload, 'from'),
+        to: requireString(payload, 'to'),
+        files,
+        ...(expectedMtimeMs === undefined ? {} : { expectedMtimeMs }),
+      })
     },
     'git.diff': async (payload) => {
       const { cwd } = await gitCwdOf(payload)

@@ -111,6 +111,53 @@ export interface GitWorktree {
   changes: number
 }
 
+/** One IDEA change list (`.idea/workspace.xml` `ChangeListManager`). */
+export interface GitChangeList {
+  /** The IDE's list id; unique within the project. */
+  id: string
+  /** The IDE's display name ('Default Changelist', 'feature-x', …). */
+  name: string
+  /** The list's own comment line ('' when none). */
+  comment: string
+  /** Whether new/unsorted changes belong here. */
+  isDefault: boolean
+  /** Absolute '/'-normalized file paths the IDE put in this list. */
+  files: string[]
+  /** Absolute '/'-normalized directory paths; files below belong here too. */
+  dirs: string[]
+}
+
+/** The `git.changelists` answer. */
+export interface GitChangeListsResult {
+  /** Whether the workspace root carries a `.idea` directory. */
+  isIdeaProject: boolean
+  /** Default list first, then the others in workspace.xml order. */
+  lists: GitChangeList[]
+  /** The workspace.xml mtime the answer was read from; a move sends it back
+   *  as its conflict baseline. Absent when the file could not be read. */
+  mtimeMs?: number
+}
+
+/** One file of a drag-and-drop move between IDEA change lists. */
+export interface GitChangeListMoveFile {
+  /** Absolute path of the file (the client projects the status row). */
+  path: string
+  /** Used only when the source list has no explicit row to reuse. */
+  status?: 'new' | 'deleted' | 'modified'
+}
+
+/** One drag-and-drop move between two IDEA change lists. */
+export interface GitChangeListMoveRequest {
+  /** The list the row was dragged FROM (the IDE's list id). */
+  from: string
+  /** The list it was dropped ONTO (the IDE's list id). */
+  to: string
+  /** The files to move; a directory drag sends its whole visible subtree. */
+  files: readonly GitChangeListMoveFile[]
+  /** The mtime of the answer the drag came from (staleness guard). */
+  expectedMtimeMs?: number
+}
+
 /** One model a provider advertises (the pinned commit-message dropdown). */
 export interface GitModelInfo {
   /** Provider-side model id (dispatched verbatim). */
@@ -499,6 +546,17 @@ export const api = {
     call<GitWorktree[]>('git.worktrees', scopePayload(scope, {}), signal),
   gitStatus: (scope: SessionScope, worktree?: string, signal?: AbortSignal) =>
     call<GitStatusResult>('git.status', gitPayload(scope, worktree, {}), signal),
+  /** The workspace's IDEA change lists (read from `.idea/workspace.xml`). A
+   *  non-IDEA workspace answers `{ isIdeaProject: false, lists: [] }`, which
+   *  the Git lens renders exactly like its plain staged/unstaged groups. */
+  gitChangeLists: (scope: SessionScope, signal?: AbortSignal) =>
+    call<GitChangeListsResult>('git.changelists', scopePayload(scope, {}), signal),
+  /** Move one file between the workspace's IDEA change lists (writes
+   *  `.idea/workspace.xml`). The answer carries the fresh lists, default
+   *  first. `expectedMtimeMs` refuses the move when the file changed since
+   *  the lists were loaded (code `changelist-stale`). */
+  gitMoveChangeListFile: (scope: SessionScope, request: GitChangeListMoveRequest) =>
+    call<GitChangeListsResult>('git.changelists.move', scopePayload(scope, { ...request })),
   gitDiff: (scope: SessionScope, path: string | undefined, staged: boolean, worktree?: string, signal?: AbortSignal) =>
     call<{ diff: string }>('git.diff', gitPayload(scope, worktree, { ...(path !== undefined ? { path } : {}), staged }), signal),
   gitStage: (scope: SessionScope, path?: string, worktree?: string) =>

@@ -10,7 +10,7 @@
  * including the `repoRoot` a container's worktree listing must carry.
  */
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { act } from 'react-dom/test-utils'
@@ -138,6 +138,12 @@ function branchButton(container: HTMLElement): HTMLButtonElement {
 }
 
 afterEach(() => { vi.restoreAllMocks() })
+
+beforeEach(() => {
+  // The lens reads the workspace's IDEA change lists on every non-silent
+  // refresh; these fixtures are plain repositories, so they answer "none".
+  vi.spyOn(api, 'gitChangeLists').mockResolvedValue({ isIdeaProject: false, lists: [] })
+})
 
 describe('GitLens (changes tab, git lens) linked-worktree consistency', () => {
   it('refreshes status, branches and history together on auto and manual selection', async () => {

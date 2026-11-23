@@ -24,6 +24,8 @@ export type SidebarErrorCode =
   | 'git-error'
   | 'graph-stale'
   | 'graph-limit'
+  | 'changelist-stale'
+  | 'changelist-move-failed'
   | 'git-suggest-empty'
   | 'git-suggest-error'
   | 'job-error'

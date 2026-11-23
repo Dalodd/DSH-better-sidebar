@@ -130,6 +130,38 @@
 .repoChip:disabled { opacity: 0.45; cursor: default; }
 .repoChip:focus-visible { outline: 2px solid var(--dsw-alias-interactive-bg-hover-accent); outline-offset: -2px; }
 
+/* ── IDEA ChangeList sections ───────────────────────────────────────────── */
+/* An IDEA project with named change lists renders one block per list (the
+   default list first) instead of the plain three bands. A block is a
+   disclosure header carrying the list's own name + file count, then the SAME
+   merge/staged/unstaged bands, scoped to the list's rows. It reuses the SCM
+   band metrics (28px header, xxs strong label) so a list header and a band
+   header read as one hierarchy; the name only gets a shrinkable ellipsis. */
+.changeList { display: flex; flex-direction: column; }
+.changeList + .changeList { border-top: 1px solid var(--dsw-alias-border-l1); }
+.changeListHeader { gap: 4px; }
+.changeListName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A file dragged from another ChangeList: the whole target section reads as
+   the drop zone. Only background/border tokens, no hard-coded colors. */
+.changeList[data-drop-target='true'] {
+  background: var(--dsw-alias-interactive-bg-hover);
+  outline: 1px solid var(--dsw-alias-border-l2);
+  outline-offset: -1px;
+}
+/* A file row that can be dragged between lists advertises it with the grab
+   cursor (the preview click still works: a drag needs a real move). */
+.row[data-draggable='true'] .rowMain,
+.row[data-draggable='true'] .dirRow { cursor: grab; }
+.row[data-draggable='true'] .rowMain:active,
+.row[data-draggable='true'] .dirRow:active { cursor: grabbing; }
+/* A single-band list carries that band's all/directory action on the list
+   header itself (the band header is not drawn), so it follows the same
+   "revealed on hover/focus" rule as a band action. */
+.changeList .headerAction { opacity: 0; transition: opacity 120ms var(--ds-ease-in-out); }
+.changeList .changeListHeader:hover .headerAction,
+.changeList .changeListHeader:focus-within .headerAction { opacity: 1; }
+@media (hover: none) { .changeList .headerAction { opacity: 1; } }
+
 /* Docked by the flex column above (a sibling of `.gitScroll`), plus sticky so
    it also survives the case where the host tab body itself scrolls the whole
    tab — the branch control must never leave the bottom of the pane.

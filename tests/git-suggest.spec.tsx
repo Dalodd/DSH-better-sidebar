@@ -41,6 +41,7 @@ async function mount(options: {
 } = {}): Promise<{ container: HTMLElement; unmount: () => void }> {
   vi.spyOn(api, 'gitWorktrees').mockResolvedValue([{ path: CWD, branch: 'main', current: true, changes: 1 }])
   vi.spyOn(api, 'gitStatus').mockResolvedValue(pendingStatus())
+  vi.spyOn(api, 'gitChangeLists').mockResolvedValue({ isIdeaProject: false, lists: [] })
   vi.spyOn(api, 'gitBranch').mockResolvedValue({ current: 'main', names: ['main'] })
   vi.spyOn(api, 'gitLog').mockResolvedValue([])
   vi.spyOn(api, 'gitCommitModel').mockResolvedValue(options.model ?? { pinned: false })

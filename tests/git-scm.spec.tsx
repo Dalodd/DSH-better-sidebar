@@ -42,6 +42,9 @@ const enter = async (box: HTMLTextAreaElement): Promise<void> => {
 }
 async function mount(readStatus: (scope: SessionScope) => GitStatusResult) {
   vi.spyOn(api, 'gitStatus').mockImplementation(async scope => readStatus(scope))
+  // The lens reads the workspace's IDEA change lists on every non-silent
+  // refresh; a plain workspace answers "no named lists" and keeps the groups.
+  vi.spyOn(api, 'gitChangeLists').mockResolvedValue({ isIdeaProject: false, lists: [] })
   vi.spyOn(api, 'gitWorktrees').mockResolvedValue([{ path: CWD, branch: 'main', current: true, changes: 2 }])
   vi.spyOn(api, 'gitBranch').mockResolvedValue({ current: 'main', names: ['main', 'feature'] })
   vi.spyOn(api, 'gitCommitModel').mockResolvedValue({ pinned: false })

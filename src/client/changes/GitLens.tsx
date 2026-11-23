@@ -7,7 +7,7 @@
  * UI semantics reference: VS Code 76f9f309edc0682f4ef9465be8d12af754b87236,
  * extensions/git and src/vs/workbench/contrib/scm (not a runtime dependency).
  */
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type MouseEvent, type ReactNode } from 'react'
 import {
   IconBranchOutlineRegular, IconCheckOutlineRegular, IconChevronRightOutlineRegular,
   IconCloseFillRegular, IconCodeOutlineRegular, IconCopyOutlineRegular, IconEllipsisOutlineRegular,
@@ -15,11 +15,11 @@ import {
   IconRefreshOutlineRegular, IconSparkleRegular, IconTrashOutlineRegular, Menu, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context } from '../../context-types.ts'
-import type { GitLineCounts, GitLogEntry, GitStatusEntry, GitStatusResult, GitWorktree, SessionScope } from '../api.ts'
+import type { GitChangeList, GitChangeListMoveRequest, GitLineCounts, GitLogEntry, GitStatusEntry, GitStatusResult, GitWorktree, SessionScope } from '../api.ts'
 import { api, SidebarApiError } from '../api.ts'
 import { builtinFileIcon, builtinFolderIcon } from '../file-icons.tsx'
 import { usePolling } from '../use-polling.ts'
-import { baseName, relativeTo } from '../paths.ts'
+import { baseName, relativeTo, workspaceRelativePath } from '../paths.ts'
 import { resolveSidebarPath } from '../paths.ts'
 import { isZh, t } from '../locales.ts'
 import { GitGraphSection, type GraphDetailsSelection } from './GitGraphSection.tsx'
@@ -28,7 +28,7 @@ import {
   ConfirmDialog, IconButton, Notice, StatusBadge, invalidateGitStatus, statusOfXY,
   useGitStatus, type GitFileStatus, type GitTone, type StatusTone,
 } from '../ui/index.ts'
-import { buildChangeTree, sumLineCounts, type ChangeDir, type ChangeFile, type ChangeNode } from './change-tree.ts'
+import { buildChangeTree, sumLineCounts, type ChangeDir, type ChangeFile, type ChangeLineTotals, type ChangeNode } from './change-tree.ts'
 import diffCss from '../diff/diff.module.css'
 import css from './changes.module.css'
 
@@ -212,6 +212,204 @@ function sideKey(counts: GitLineCounts | undefined): string {
   return 'additions' in counts ? `${counts.additions}/${counts.deletions}` : 'binary'
 }
 
+/** One status answer split into the three bands the lens renders. The trees and
+ *  totals belong to the split (not to a separate memo) so a ChangeList section
+ *  and the plain fallback view can reuse exactly the same folding pass. */
+interface ChangeSplit {
+  mergeEntries: GitStatusEntry[]
+  stagedEntries: GitStatusEntry[]
+  unstagedEntries: GitStatusEntry[]
+  mergeTree: ChangeNode[]
+  stagedTree: ChangeNode[]
+  unstagedTree: ChangeNode[]
+  stagedTotal: ChangeLineTotals
+  unstagedTotal: ChangeLineTotals
+}
+
+/**
+ * Fold one set of `git status` rows into the merge / staged / unstaged bands
+ * the lens paints. Pure and identity-stable for an unchanged input list: the
+ * caller memoizes on the content key, so idle polls keep every row's props.
+ */
+function splitChanges(entries: readonly GitStatusEntry[]): ChangeSplit {
+  const merge = entries.filter(entry => statusOfXY(entry.xy)?.tone === 'conflict')
+  const regular = entries.filter(entry => statusOfXY(entry.xy)?.tone !== 'conflict')
+  const staged = regular.filter(isStagedEntry)
+  const unstaged = regular.filter(isUnstagedEntry)
+  // A row's porcelain code is a PAIR, and each band reads its own half:
+  // 'MD' is an 'M' in the Staged band and a 'D' in the Changes band. The
+  // rewrite is display-only (a fresh object per row), so the mutations below
+  // still see the real code.
+  const sideEntries = (rows: GitStatusEntry[], index: number): GitStatusEntry[] => rows.map(entry => ({
+    ...entry, xy: entry.xy === '??' ? '??' : index === 0 ? `${entry.xy[0]} ` : ` ${entry.xy[1]}`,
+  }))
+  // A conflicted row prints no line count: both diffs see the conflict,
+  // and printing either side's number as "the" number is the double-count
+  // class #908 was about.
+  const mergeTree = buildChangeTree(merge)
+  // Each band's rows carry THAT band's reading: a path changed on both
+  // sides sits in both trees, and neither may see the other's number.
+  const stagedTree = buildChangeTree(sideEntries(staged, 0), 'staged')
+  const unstagedTree = buildChangeTree(sideEntries(unstaged, 1), 'unstaged')
+  return {
+    mergeEntries: merge,
+    stagedEntries: staged,
+    unstagedEntries: unstaged,
+    mergeTree,
+    stagedTree,
+    unstagedTree,
+    // The band totals (#131) sum the very nodes the rows render, so the
+    // header can never disagree with the numbers printed under it.
+    stagedTotal: sumLineCounts(stagedTree),
+    unstagedTotal: sumLineCounts(unstagedTree),
+  }
+}
+
+/**
+ * The comparison key of one path for ChangeList membership. IDEA stores
+ * ABSOLUTE paths while `git status` reports repo-relative rows, so both sides
+ * are first projected onto the same root (see `workspaceRelativePath`); this
+ * helper only normalizes separators and folds case when the ROOT is a Windows
+ * spelling (a drive or UNC path), because a POSIX root keeps case.
+ */
+function pathKey(value: string, foldCase: boolean): string {
+  const normalized = value.replace(/\\/g, '/').replace(/\/+$/, '')
+  return foldCase ? normalized.toLowerCase() : normalized
+}
+
+/** Whether a workspace root names a Windows path (drive letter or UNC share). */
+function foldsCaseOf(root: string | undefined): boolean {
+  if (root === undefined) return false
+  return /^[A-Za-z]:[\\/]/.test(root) || /^[\\/]{2}[^\\/]/.test(root)
+}
+
+/** Whether two strings arrays say the same thing (identity ignored). */
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+/** Whether two `git.changelists` answers say the same thing. */
+function sameChangeLists(left: readonly GitChangeList[], right: readonly GitChangeList[]): boolean {
+  if (left === right) return true
+  if (left.length !== right.length) return false
+  return left.every((list, index) => {
+    const other = right[index]!
+    return list.id === other.id && list.name === other.name && list.comment === other.comment
+      && list.isDefault === other.isDefault
+      && sameStrings(list.files, other.files) && sameStrings(list.dirs, other.dirs)
+  })
+}
+
+/** One ChangeList section's rows plus the callbacks whose identity must
+ *  survive an idle poll (the memoized rows take them as props). */
+interface ChangeListSection {
+  id: string
+  name: string
+  isDefault: boolean
+  /** Unique files in the list (an 'MM' path counts once). */
+  files: number
+  split: ChangeSplit
+  /** Stage/unstage one path — or this list's whole band when absent — scoped
+   *  to this list only (the plain `stageEntry` would act across every list). */
+  stage: (path: string | undefined, staged: boolean, merge?: boolean) => void
+  /** Start dragging one of this list's file rows (stable across idle polls). */
+  dragStart: (event: ReactDragEvent<HTMLElement>, node: ChangeFile) => void
+  /** Start dragging a directory: every changed file under it moves together. */
+  dragStartDir: (event: ReactDragEvent<HTMLElement>, node: ChangeDir) => void
+}
+
+/** The band rows a ChangeList-scoped stage action may touch. */
+type StageScope = Pick<ChangeSplit, 'mergeEntries' | 'stagedEntries' | 'unstagedEntries'>
+
+/**
+ * The drag payload of a file row between ChangeList sections. The browser's
+ * DataTransfer is the transport (no React state): the source section and the
+ * status row travel with the drag, and the DROP target supplies the
+ * destination list.
+ */
+const CHANGELIST_DRAG_MIME = 'application/x-dsh-changelist-file'
+
+/** One file carried by a ChangeList drag. */
+interface ChangeListDragFile {
+  /** The row's repo-relative path (the drop projects it onto its root). */
+  path: string
+  /** How the file changed, for a synthesized `<change>` row. */
+  status: 'new' | 'deleted' | 'modified'
+}
+
+/** One in-flight ChangeList drag (a file row or a directory's subtree). */
+interface ChangeListDragPayload {
+  /** The source list's IDE id. */
+  from: string
+  /** One file for a file row; every changed file under the directory. */
+  files: ChangeListDragFile[]
+}
+
+/** The status kind that decides a synthesized row's attributes. */
+function dragStatusOf(status: GitFileStatus): ChangeListDragFile['status'] {
+  if (status.tone === 'untracked') return 'new'
+  if (status.tone === 'deleted') return 'deleted'
+  return 'modified'
+}
+
+/** Every changed file under one directory in a section, de-duplicated. */
+function filesUnderDirectory(split: ChangeSplit, directory: string): ChangeListDragFile[] {
+  const prefix = `${directory.replace(/\/+$/, '')}/`
+  const seen = new Set<string>()
+  const files: ChangeListDragFile[] = []
+  for (const entry of [...split.mergeEntries, ...split.stagedEntries, ...split.unstagedEntries]) {
+    if (entry.path !== directory && !entry.path.startsWith(prefix)) continue
+    if (seen.has(entry.path)) continue
+    const status = statusOfXY(entry.xy)
+    if (status === undefined) continue
+    seen.add(entry.path)
+    files.push({ path: entry.path, status: dragStatusOf(status) })
+  }
+  return files
+}
+
+/** One drag payload's files as the wire shape (validated, bounded). */
+function dragFilesOf(value: unknown): ChangeListDragFile[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 2_000) return null
+  const files: ChangeListDragFile[] = []
+  for (const item of value) {
+    if (item === null || typeof item !== 'object') return null
+    const record = item as { path?: unknown; status?: unknown }
+    if (typeof record.path !== 'string' || record.path === '') return null
+    const status = record.status === 'new' || record.status === 'deleted' || record.status === 'modified'
+      ? record.status
+      : 'modified'
+    files.push({ path: record.path, status })
+  }
+  return files
+}
+
+/** Read and validate the drag payload (foreign drags answer null). */
+function readChangeListDrag(transfer: DataTransfer | null): ChangeListDragPayload | null {
+  if (transfer === null) return null
+  let parsed: unknown
+  try {
+    const raw = transfer.getData(CHANGELIST_DRAG_MIME)
+    if (raw === '') return null
+    parsed = JSON.parse(raw) as unknown
+  } catch {
+    return null
+  }
+  if (parsed === null || typeof parsed !== 'object') return null
+  const record = parsed as { from?: unknown; files?: unknown }
+  if (typeof record.from !== 'string' || record.from === '') return null
+  const files = dragFilesOf(record.files)
+  return files === null ? null : { from: record.from, files }
+}
+
+/** Whether a drag carries one of our file payloads (readable during `dragover`
+ *  only through `types` — browsers withhold the data until the drop). */
+function carriesChangeListDrag(transfer: DataTransfer | null): boolean {
+  if (transfer === null) return false
+  return Array.from(transfer.types).includes(CHANGELIST_DRAG_MIME)
+}
+
+
 /** The `+N` / `−M` pair, ink and sign included: shared by a file row and its
  *  group header so the two can never drift apart. A zero side is omitted (the
  *  diff pane's own convention), and both numbers stay on the element as
@@ -263,6 +461,11 @@ const FileRow = memo(function FileRow(props: {
   staged: boolean
   busy: boolean
   selected: boolean
+  /** Whether this row can be dragged to another ChangeList section. */
+  draggable?: boolean
+  onDragStart?: (event: ReactDragEvent<HTMLElement>, node: ChangeFile) => void
+  /** Clear the destination highlight when a drag ends anywhere. */
+  onDragEnd?: () => void
   onPreview: (node: ChangeFile, staged: boolean) => void
   onContextMenu: (event: MouseEvent, node: ChangeFile, staged: boolean) => void
   onToggleStage: (path: string, staged: boolean) => void
@@ -270,7 +473,12 @@ const FileRow = memo(function FileRow(props: {
   const { row: node, staged, busy, selected } = props
   const action = staged ? t('unstage') : t('stage')
   return (
-    <div className={css.row} style={{ paddingLeft: props.depth * 12 + 8 }} data-row={node.path} data-selected={selected ? 'true' : undefined}>
+    <div className={css.row} style={{ paddingLeft: props.depth * 12 + 8 }} data-row={node.path}
+      data-selected={selected ? 'true' : undefined}
+      data-draggable={props.draggable === true ? 'true' : undefined}
+      draggable={props.draggable === true ? true : undefined}
+      onDragStart={props.onDragStart === undefined ? undefined : (event) => { props.onDragStart!(event, node) }}
+      onDragEnd={props.onDragEnd}>
       <IndentGuides depth={props.depth} />
       <button
         type="button"
@@ -314,14 +522,26 @@ const DirRow = memo(function DirRow(props: {
   open: boolean
   busy: boolean
   merge: boolean
+  /** The row's fold key, as its owner computed it. A ChangeList section's key
+   *  carries the list id prefix, so the row cannot rebuild it from path+band
+   *  alone (that was the "directory does not fold" bug). */
+  foldKey: string
+  /** Whether this directory can be dragged to another ChangeList section. */
+  draggable?: boolean
+  onDragStart?: (event: ReactDragEvent<HTMLElement>, node: ChangeDir) => void
+  /** Clear the destination highlight when a drag ends anywhere. */
+  onDragEnd?: () => void
   onToggle: (key: string) => void
   onToggleStage: (path: string, staged: boolean, merge?: boolean) => void
 }): ReactNode {
   const { row: node, staged, open, busy, merge } = props
-  const key = `${merge ? 'm' : staged ? 's' : 'u'}:${node.path}`
   const action = staged ? t('unstageAll') : t('stageAll')
   return (
-    <div className={css.row} style={{ paddingLeft: props.depth * 12 + 8 }} data-row={node.path}>
+    <div className={css.row} style={{ paddingLeft: props.depth * 12 + 8 }} data-row={node.path}
+      data-draggable={props.draggable === true ? 'true' : undefined}
+      draggable={props.draggable === true ? true : undefined}
+      onDragStart={props.onDragStart === undefined ? undefined : (event) => { props.onDragStart!(event, node) }}
+      onDragEnd={props.onDragEnd}>
       <IndentGuides depth={props.depth} />
       <button
         type="button"
@@ -329,7 +549,7 @@ const DirRow = memo(function DirRow(props: {
         data-dir={node.path}
         aria-expanded={open}
         title={node.path}
-        onClick={() => { props.onToggle(key) }}
+        onClick={() => { props.onToggle(props.foldKey) }}
       >
         <span className={css.chevron} data-open={open ? 'true' : undefined} aria-hidden="true">
           <IconChevronRightOutlineRegular size={12} />
@@ -471,6 +691,20 @@ export function GitLens(props: GitLensProps) {
   const [actionError, setActionError] = useState<string | null>(null)
   /** The lens-level error banner (refresh / branch switch / history paging). */
   const [viewError, setViewError] = useState<string | null>(null)
+  /** The workspace's IDEA change lists (`git.changelists`). Empty while the
+   *  answer is unknown, on a non-IDEA workspace, or when the project defines
+   *  only its default list — all three keep the plain group rendering. */
+  const [changeLists, setChangeLists] = useState<GitChangeList[]>([])
+  /** The mtime of the answer above: a drag sends it back so the host refuses
+   *  to overwrite a workspace.xml the IDE saved since. */
+  const changeListMtime = useRef<number | undefined>(undefined)
+  /** Serializes list answers: a load/move that started earlier must not
+   *  publish over a newer one (a drop landing while a refresh is in flight). */
+  const changeListSeq = useRef(0)
+  /** One move at a time: two drops in the same gesture would race the file. */
+  const changeMoveLock = useRef(false)
+  /** The ChangeList section a drag is currently hovering (drop highlight). */
+  const [changeListDropTarget, setChangeListDropTarget] = useState<string | null>(null)
 
   /** The open file-row context menu (cursor position for the portaled Menu). */
   const [fileMenu, setFileMenu] = useState<FileMenuState | null>(null)
@@ -508,6 +742,33 @@ export function GitLens(props: GitLensProps) {
     const base = scopeRef.current
     return repoRootRef.current === undefined ? { ...base } : { ...base, repoRoot: repoRootRef.current }
   }, [])
+
+  /**
+   * Re-read the workspace's IDEA change lists. This is ONE local file read and
+   * runs only on a non-silent refresh (mount, the visibility edge, the refresh
+   * button, an action) — never on the 30 s inventory tick. A workspace whose
+   * answer is not an IDEA project, or that defines no named list, clears the
+   * record so the lens falls back to its plain groups; a failed read does the
+   * same (grouping is a convenience, never a reason for an error banner).
+   */
+  const loadChangeLists = useCallback(async (): Promise<void> => {
+    const generation = scopeGen.current
+    const seq = ++changeListSeq.current
+    try {
+      const result = await api.gitChangeLists(gitScopeNow())
+      if (generation !== scopeGen.current || seq !== changeListSeq.current) return
+      const lists = result.isIdeaProject ? result.lists : []
+      // An unchanged answer must keep its identity: the sections memo (and
+      // every memoized row under it) hangs off it.
+      setChangeLists(previous => (sameChangeLists(previous, lists) ? previous : lists))
+      changeListMtime.current = result.mtimeMs
+    } catch {
+      if (generation === scopeGen.current && seq === changeListSeq.current) {
+        setChangeLists(previous => (previous.length === 0 ? previous : []))
+        changeListMtime.current = undefined
+      }
+    }
+  }, [gitScopeNow])
 
   /** Label the generate button with the model the next suggestion would use.
    *  Re-read whenever the panel becomes visible: the pinned route lives in the
@@ -599,6 +860,10 @@ export function GitLens(props: GitLensProps) {
    *  The shared status store follows the same selection on its own. */
   const runOnce = useCallback(async (silent: boolean, signal?: AbortSignal): Promise<void> => {
     const generation = scopeGen.current
+    // The change lists are workspace state, parallel to the checkout listing:
+    // read them on every non-silent pass so a list created/renamed in the IDE
+    // shows up on refresh, but keep the 30 s inventory tick free of the read.
+    if (!silent) void loadChangeLists()
     let listed: GitWorktree[]
     try {
       listed = await api.gitWorktrees(gitScopeNow(), signal)
@@ -646,7 +911,7 @@ export function GitLens(props: GitLensProps) {
     // branch may have moved under it.
     setGraphRefresh(value => value + 1)
     await loadTarget(target)
-  }, [gitScopeNow, loadTarget])
+  }, [gitScopeNow, loadTarget, loadChangeLists])
 
   /** Run one refresh, replaying a request that arrives mid-flight exactly once. */
   const refresh = useCallback(async (silent = false, signal?: AbortSignal): Promise<void> => {
@@ -688,6 +953,12 @@ export function GitLens(props: GitLensProps) {
     setRepoChoices([])
     clearDerived()
     setViewError(null)
+    // Another scope's project may be an IDEA one: never paint its lists (or
+    // fall back to groups only because the previous answer lingered).
+    setChangeLists([])
+    changeListMtime.current = undefined
+    changeListSeq.current += 1
+    setChangeListDropTarget(null)
     // The three destructive entry points are aimed at a ROW of the previous
     // scope: the menus carry that row's path and `confirmPending` executes a
     // closure over it, while `gitScopeNow()` already reads the NEW scope — so
@@ -758,15 +1029,31 @@ export function GitLens(props: GitLensProps) {
   const pushError = (reason: unknown): string => `${t('pushError')}: ${errorMessage(reason)}`
   const pullError = (reason: unknown): string => `${t('pullError')}: ${errorMessage(reason)}`
 
-  const stageEntry = (path: string | undefined, staged: boolean, merge = false): void => {
+  /**
+   * Stage/unstage one path, or one whole band when `path` is absent.
+   *
+   * `scope` narrows the band to ONE ChangeList: the section headers and
+   * directory rows of a per-list section must never stage rows that belong to
+   * another list (the plain fallback view has no scope and keeps the global
+   * bands). A single-path action ignores the scope's membership beyond picking
+   * the band — the click already names the row.
+   */
+  const stageEntry = (path: string | undefined, staged: boolean, merge = false, scope?: StageScope): void => {
     const gitScope = gitScopeNow()
     const target = selectedWorktree
     // With conflicts, directory/all actions must only touch their own group:
     // git add/reset on the whole directory would silently resolve/reset Merge.
-    const rows = staged ? stagedEntries : merge || mergeEntries.some(entry => entry.path === path) ? mergeEntries : unstagedEntries
-    const paths = mergeEntries.length === 0 ? [path] : rows
-      .filter(entry => path === undefined || entry.path === path || entry.path.startsWith(`${path}/`))
-      .map(entry => entry.path)
+    const rows = scope === undefined
+      ? staged ? stagedEntries : merge || mergeEntries.some(entry => entry.path === path) ? mergeEntries : unstagedEntries
+      : staged ? scope.stagedEntries
+        : merge || scope.mergeEntries.some(entry => entry.path === path) ? scope.mergeEntries : scope.unstagedEntries
+    const paths = scope === undefined
+      ? mergeEntries.length === 0 ? [path] : rows
+        .filter(entry => path === undefined || entry.path === path || entry.path.startsWith(`${path}/`))
+        .map(entry => entry.path)
+      : rows
+        .filter(entry => path === undefined || entry.path === path || entry.path.startsWith(`${path}/`))
+        .map(entry => entry.path)
     void runAction(async () => {
       for (const selectedPath of paths) {
         if (staged) await api.gitUnstage(gitScope, selectedPath, target)
@@ -774,6 +1061,16 @@ export function GitLens(props: GitLensProps) {
       }
     }, stageError)
   }
+
+  /** The latest `stageEntry` for section callbacks created inside a memo: the
+   *  memo's identity must survive an idle poll, while the callback still runs
+   *  against the CURRENT checkout selection. */
+  const stageScoped = useRef((path: string | undefined, staged: boolean, merge: boolean, scope: StageScope): void => {
+    stageEntry(path, staged, merge, scope)
+  })
+  useEffect(() => {
+    stageScoped.current = (path, staged, merge, scope) => { stageEntry(path, staged, merge, scope) }
+  })
 
   const stageAll = (staged: boolean, merge = false): void => { stageEntry(undefined, staged, merge) }
 
@@ -938,41 +1235,178 @@ export function GitLens(props: GitLensProps) {
   // The CONTENT of the answer decides whether the tree must be rebuilt; the
   // array identity only decides whether the (cheap) key is recomputed.
   const contentKey = useMemo(() => entriesKey(entries), [entries])
-  // One fold per group, rebuilt only when the change list's CONTENT changes —
-  // never on a poll that answered the same files, however fresh its arrays are.
-  const { mergeEntries, stagedEntries, unstagedEntries, mergeTree, stagedTree, unstagedTree } = useMemo(() => {
-    const merge = entries.filter(entry => statusOfXY(entry.xy)?.tone === 'conflict')
-    const regular = entries.filter(entry => statusOfXY(entry.xy)?.tone !== 'conflict')
-    const staged = regular.filter(isStagedEntry)
-    const unstaged = regular.filter(isUnstagedEntry)
-    // A row's porcelain code is a PAIR, and each band reads its own half:
-    // 'MD' is an 'M' in the Staged band and a 'D' in the Changes band. The
-    // rewrite is display-only (a fresh object per row), so the mutations below
-    // still see the real code.
-    const sideEntries = (rows: GitStatusEntry[], index: number): GitStatusEntry[] => rows.map(entry => ({
-      ...entry, xy: entry.xy === '??' ? '??' : index === 0 ? `${entry.xy[0]} ` : ` ${entry.xy[1]}`,
-    }))
-    return {
-      mergeEntries: merge,
-      stagedEntries: staged,
-      unstagedEntries: unstaged,
-      // A conflicted row prints no line count: both diffs see the conflict,
-      // and printing either side's number as "the" number is the double-count
-      // class #908 was about.
-      mergeTree: buildChangeTree(merge),
-      // Each band's rows carry THAT band's reading: a path changed on both
-      // sides sits in both trees, and neither may see the other's number.
-      stagedTree: buildChangeTree(sideEntries(staged, 0), 'staged'),
-      unstagedTree: buildChangeTree(sideEntries(unstaged, 1), 'unstaged'),
+  // The plain fallback view: one fold of ALL rows. Rebuilt only when the change
+  // list's CONTENT changes — never on a poll that answered the same files,
+  // however fresh its arrays are.
+  const {
+    mergeEntries, stagedEntries, unstagedEntries, mergeTree, stagedTree, unstagedTree,
+    stagedTotal, unstagedTotal,
+    // The key stands in for `entries`: same content ⇒ same split ⇒ the memoized
+    // rows below keep their props and never re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  } = useMemo(() => splitChanges(entries), [contentKey])
+  /**
+   * The IDEA view: one section per named ChangeList, the default list at the
+   * top. Each section carries the SAME three bands as the fallback view, bucketed
+   * to that list's rows.
+   *
+   * Membership is decided by the FIRST non-default list that names a row (by
+   * exact file path, or by a recorded directory prefix); every row named by no
+   * such list lands in the default list — which is exactly the "new changes"
+   * rule. A workspace with no named list (or an unreadable/unusable answer)
+   * renders the plain view instead.
+   *
+   * The memo is keyed by `contentKey`, not by the entries array: an idle poll
+   * answering the same files must keep every row's props (and so its render).
+   * `stage` reads the latest `stageEntry` through `stageScoped`, so the memo's
+   * identity can survive a checkout switch without staging into the old one.
+   */
+  const changeListSections = useMemo((): ChangeListSection[] | null => {
+    const root = snapshot?.root
+    if (root === undefined || changeLists.length === 0) return null
+    const named = changeLists.filter(list => !list.isDefault)
+    const defaultList = changeLists.find(list => list.isDefault)
+    if (defaultList === undefined || named.length === 0) return null
+    const foldCase = foldsCaseOf(root)
+    const memberships = named.map(list => {
+      const files = new Set<string>()
+      for (const file of list.files) {
+        const relative = workspaceRelativePath(root, file)
+        if (relative !== undefined) files.add(pathKey(relative, foldCase))
+      }
+      const dirs = list.dirs
+        .map(dir => workspaceRelativePath(root, dir))
+        .filter((dir): dir is string => dir !== undefined && dir !== '.')
+        .map(dir => `${pathKey(dir, foldCase)}/`)
+      return { files, dirs }
+    })
+    const ownerOf = new Map<string, number>()
+    for (const entry of entries) {
+      const key = pathKey(entry.path, foldCase)
+      if (ownerOf.has(key)) continue
+      const owner = memberships.findIndex(candidate => candidate.files.has(key)
+        || candidate.dirs.some(prefix => key.startsWith(prefix)))
+      if (owner !== -1) ownerOf.set(key, owner)
     }
-    // The key stands in for `entries`: same content ⇒ same tree objects ⇒ the
+    const buckets: GitStatusEntry[][] = named.map(() => [])
+    const defaultEntries: GitStatusEntry[] = []
+    for (const entry of entries) {
+      const owner = ownerOf.get(pathKey(entry.path, foldCase))
+      if (owner === undefined) defaultEntries.push(entry)
+      else buckets[owner]!.push(entry)
+    }
+    const sectionOf = (list: GitChangeList, rows: GitStatusEntry[]): ChangeListSection => {
+      const split = splitChanges(rows)
+      // One 'MM' path sits in both bands but is still ONE changed file.
+      const files = new Set<string>()
+      for (const entry of rows) files.add(entry.path)
+      return {
+        id: list.id,
+        // An IDE always names its lists; the id keeps a hand-edited blank row
+        // usable without inventing localized copy here.
+        name: list.name !== '' ? list.name : list.id,
+        isDefault: list.isDefault,
+        files: files.size,
+        split,
+        stage: (path, staged, merge) => { stageScoped.current(path, staged, merge === true, split) },
+        dragStart: (event, node) => {
+          const transfer = event.dataTransfer
+          if (transfer === null) return
+          transfer.effectAllowed = 'move'
+          transfer.setData(CHANGELIST_DRAG_MIME, JSON.stringify({
+            from: list.id,
+            files: [{ path: node.path, status: dragStatusOf(node.status) }],
+          } satisfies ChangeListDragPayload))
+        },
+        dragStartDir: (event, node) => {
+          const transfer = event.dataTransfer
+          if (transfer === null) return
+          // The whole visible subtree, across bands: a file changed on both
+          // sides is one row but ONE file, and all of them leave this list.
+          const files = filesUnderDirectory(split, node.path)
+          if (files.length === 0) return
+          transfer.effectAllowed = 'move'
+          transfer.setData(CHANGELIST_DRAG_MIME, JSON.stringify({
+            from: list.id,
+            files,
+          } satisfies ChangeListDragPayload))
+        },
+      }
+    }
+    return [
+      sectionOf(defaultList, defaultEntries),
+      ...named.map((list, index) => sectionOf(list, buckets[index]!)),
+    ]
+    // The key stands in for `entries`: same content ⇒ same sections ⇒ the
     // memoized rows below keep their props and never re-render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contentKey])
-  // The band totals (#131) sum the very nodes the rows render, so the header
-  // can never disagree with the numbers printed under it.
-  const unstagedTotal = useMemo(() => sumLineCounts(unstagedTree), [unstagedTree])
-  const stagedTotal = useMemo(() => sumLineCounts(stagedTree), [stagedTree])
+  }, [changeLists, contentKey, snapshot?.root])
+
+  /** Clear the destination highlight (also the rows' drag-end callback). */
+  const clearChangeListDrop = useCallback((): void => { setChangeListDropTarget(null) }, [])
+
+  /**
+   * Move one dragged file into another ChangeList. The absolute path is
+   * projected here, from the same status root the rows were read with; the
+   * host edits `.idea/workspace.xml` and answers the fresh lists. A stale
+   * workspace.xml (the IDE saved it since) is a `changelist-stale` failure:
+   * refresh the lists and let the user retry.
+   */
+  const moveFileToChangeList = async (payload: ChangeListDragPayload & { to: string }): Promise<void> => {
+    if (payload.from === payload.to || changeMoveLock.current) return
+    const root = snapshot?.root
+    if (root === undefined) return
+    const generation = scopeGen.current
+    const seq = ++changeListSeq.current
+    changeMoveLock.current = true
+    setActionError(null)
+    try {
+      const request: GitChangeListMoveRequest = {
+        from: payload.from,
+        to: payload.to,
+        files: payload.files.map(file => ({
+          path: resolveSidebarPath(root, file.path),
+          status: file.status,
+        })),
+        ...(changeListMtime.current === undefined ? {} : { expectedMtimeMs: changeListMtime.current }),
+      }
+      const result = await api.gitMoveChangeListFile(gitScopeNow(), request)
+      if (generation !== scopeGen.current || seq !== changeListSeq.current) return
+      setChangeLists(result.isIdeaProject ? result.lists : [])
+      changeListMtime.current = result.mtimeMs
+    } catch (reason) {
+      if (generation !== scopeGen.current || seq !== changeListSeq.current) return
+      setActionError(errorMessage(reason))
+      if (reason instanceof SidebarApiError && reason.code === 'changelist-stale') void loadChangeLists()
+    } finally {
+      changeMoveLock.current = false
+    }
+  }
+
+  /** Accept our file payload on a section: allowed drop + highlight. */
+  const dragOverChangeList = (event: ReactDragEvent<HTMLElement>, section: ChangeListSection): void => {
+    if (!carriesChangeListDrag(event.dataTransfer)) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    setChangeListDropTarget(current => (current === section.id ? current : section.id))
+  }
+
+  /** Drop the highlight when the pointer leaves the section for its outside. */
+  const leaveChangeList = (event: ReactDragEvent<HTMLElement>, section: ChangeListSection): void => {
+    const next = event.relatedTarget
+    if (next !== null && event.currentTarget.contains(next as Node)) return
+    setChangeListDropTarget(current => (current === section.id ? null : current))
+  }
+
+  /** Move the dragged file into this section's list. */
+  const dropOnChangeList = (event: ReactDragEvent<HTMLElement>, section: ChangeListSection): void => {
+    if (!carriesChangeListDrag(event.dataTransfer)) return
+    event.preventDefault()
+    setChangeListDropTarget(null)
+    const payload = readChangeListDrag(event.dataTransfer)
+    if (payload === null || payload.from === section.id) return
+    void moveFileToChangeList({ ...payload, to: section.id })
+  }
   const isRepo = snapshot?.isRepo === true
   const branch = snapshot?.branch ?? ''
   const clean = isRepo && entries.length === 0
@@ -1030,48 +1464,88 @@ export function GitLens(props: GitLensProps) {
     setFileMenu({ path: node.path, staged, untracked: isUntrackedStatus(node.status), x: event.clientX, y: event.clientY })
   }, [])
 
+  /** A section's key prefix: '<id>\0' or '' for the plain view. It keeps a
+   *  fold in one ChangeList from folding the same path in another list, and
+   *  keeps each rendered row's React key unique across sections. */
+  const sectionPrefix = (section: ChangeListSection | undefined): string => (section === undefined ? '' : `${section.id}\u0000`)
+
+  /** The stage callback a section's rows call: list-scoped when present,
+   *  the global band action otherwise. */
+  const sectionStage = (section: ChangeListSection | undefined): ((path: string, staged: boolean, merge?: boolean) => void) => (
+    section === undefined ? stagePath : section.stage
+  )
+
   /** Indent the content, not its container: hover and selection stay full-width. */
-  const renderFile = (node: ChangeFile, staged: boolean, depth = 0): ReactNode => (
+  const renderFile = (node: ChangeFile, staged: boolean, depth = 0, section?: ChangeListSection): ReactNode => (
     <FileRow
-      key={`file:${staged ? 's' : 'u'}:${node.path}`}
+      key={`file:${sectionPrefix(section)}${staged ? 's' : 'u'}:${node.path}`}
       row={node}
       depth={depth}
       glyph={fileGlyph}
       staged={staged}
       busy={busy || suggesting}
       selected={isPreviewedWorktree(node.path, staged)}
+      draggable={section !== undefined}
+      onDragStart={section?.dragStart}
+      onDragEnd={section === undefined ? undefined : clearChangeListDrop}
       onPreview={previewFile}
       onContextMenu={openRowMenu}
-      onToggleStage={stagePath}
+      onToggleStage={sectionStage(section)}
     />
   )
 
-  const renderDir = (node: ChangeDir, staged: boolean, merge: boolean, depth = 0): ReactNode => {
-    const key = `${merge ? 'm' : staged ? 's' : 'u'}:${node.path}`
+  const renderDir = (node: ChangeDir, staged: boolean, merge: boolean, depth = 0, section?: ChangeListSection): ReactNode => {
+    const key = `${sectionPrefix(section)}${merge ? 'm' : staged ? 's' : 'u'}:${node.path}`
     const open = !collapsed.has(key)
     return (
       <div key={`dir:${key}`}>
         <DirRow row={node} depth={depth} folderGlyph={folderGlyph} staged={staged}
-          open={open} busy={busy || suggesting} merge={merge} onToggle={toggleDir} onToggleStage={stagePath} />
+          open={open} busy={busy || suggesting} merge={merge} foldKey={key}
+          draggable={section !== undefined}
+          onDragStart={section?.dragStartDir}
+          onDragEnd={section === undefined ? undefined : clearChangeListDrop}
+          onToggle={toggleDir} onToggleStage={sectionStage(section)} />
         {open && node.children.map(child => child.kind === 'dir'
-          ? renderDir(child, staged, merge, depth + 1) : renderFile(child, staged, depth + 1))}
+          ? renderDir(child, staged, merge, depth + 1, section) : renderFile(child, staged, depth + 1, section))}
       </div>
     )
   }
 
-  const renderTree = (nodes: readonly ChangeNode[], staged: boolean, merge = false): ReactNode => (
+  const renderTree = (nodes: readonly ChangeNode[], staged: boolean, merge = false, section?: ChangeListSection): ReactNode => (
     <div className={css.tree}>
-      {nodes.map(node => (node.kind === 'dir' ? renderDir(node, staged, merge) : renderFile(node, staged)))}
+      {nodes.map(node => (node.kind === 'dir' ? renderDir(node, staged, merge, 0, section) : renderFile(node, staged, 0, section)))}
     </div>
   )
 
-  const renderGroup = (id: string, label: string, rows: readonly GitStatusEntry[], nodes: readonly ChangeNode[], staged: boolean, merge = false): ReactNode => {
+  /**
+   * Render one band. `section` names the ChangeList the band belongs to: its
+   * key then carries a `'<list id>\u0000'` prefix (so folds and React keys are
+   * per list), its totals come from the section's own split, and its
+   * all/directory action is scoped to the section's rows. Without a section the
+   * band is the plain fallback view and behaves exactly as before.
+   */
+  const renderGroup = (
+    id: string,
+    label: string,
+    rows: readonly GitStatusEntry[],
+    nodes: readonly ChangeNode[],
+    staged: boolean,
+    merge = false,
+    section?: ChangeListSection,
+  ): ReactNode => {
     if (rows.length === 0) return null
-    const key = `group:${id}`
+    const key = section === undefined ? `group:${id}` : `group:${section.id}:${id}`
     const open = !collapsed.has(key)
-    const totals = staged ? stagedTotal : merge ? undefined : unstagedTotal
+    const totals = staged
+      ? section?.split.stagedTotal ?? stagedTotal
+      : merge ? undefined : section?.split.unstagedTotal ?? unstagedTotal
+    const groupId = section === undefined ? id : `${section.id}:${id}`
+    const stageBand = (bandStaged: boolean, bandMerge = false): void => {
+      if (section === undefined) stageAll(bandStaged, bandMerge)
+      else section.stage(undefined, bandStaged, bandMerge)
+    }
     return (
-      <div className={css.group} data-group={id}>
+      <div key={key} className={css.group} data-group={groupId}>
         <div className={`${css.scmHeader} ${css.groupHeader}`}>
           <button type="button" className={css.scmDisclosure} aria-expanded={open} aria-label={`${label} (${rows.length})`} onClick={() => { toggleDir(key) }}>
             <span className={css.chevron} data-open={open ? 'true' : undefined} aria-hidden="true"><IconChevronRightOutlineRegular size={12} /></span>
@@ -1081,10 +1555,66 @@ export function GitLens(props: GitLensProps) {
           <IconButton className={css.headerAction} size="sm" disabled={busy || suggesting}
             label={staged ? t('unstageAll') : t('stageAll')}
             icon={staged ? MINUS_ICON : <IconPlusOutlineRegular size={12} />}
-            onClick={() => { stageAll(staged, merge) }} />
+            onClick={() => { stageBand(staged, merge) }} />
           <span className={css.countPill} data-count={rows.length}>{rows.length}</span>
         </div>
-        {open && renderTree(nodes, staged, merge)}
+        {open && renderTree(nodes, staged, merge, section)}
+      </div>
+    )
+  }
+
+  /**
+   * One ChangeList section.
+   *
+   * A list holding a single band (the common case: only unstaged files) reads
+   * as ONE list: its line totals sit on the list header and its rows hang
+   * directly below it — an inner "Changes" header would just repeat the list
+   * name. A list crossing bands (staged + unstaged, or a conflict) keeps the
+   * three band headers, because only those say which band a row's action
+   * applies to; the header then shows no aggregate total, since summing the
+   * index and worktree readings of one path is exactly the double count the
+   * rows avoid.
+   */
+  const renderChangeList = (section: ChangeListSection): ReactNode => {
+    const key = `changelist:${section.id}`
+    const open = !collapsed.has(key)
+    const bands = [
+      { id: 'merge', label: t('gitMergeChanges'), rows: section.split.mergeEntries, nodes: section.split.mergeTree, staged: false, merge: true },
+      { id: 'staged', label: t('gitStagedChanges'), rows: section.split.stagedEntries, nodes: section.split.stagedTree, staged: true, merge: false },
+      { id: 'unstaged', label: t('gitChanges'), rows: section.split.unstagedEntries, nodes: section.split.unstagedTree, staged: false, merge: false },
+    ].filter(band => band.rows.length > 0)
+    const only = bands.length === 1 ? bands[0] : undefined
+    const totals = only === undefined
+      ? undefined
+      : only.staged ? section.split.stagedTotal
+        : only.merge ? undefined : section.split.unstagedTotal
+    return (
+      <div key={key} className={css.changeList} data-changelist={section.id}
+        data-changelist-default={section.isDefault ? 'true' : undefined}
+        data-drop-target={changeListDropTarget === section.id ? 'true' : undefined}
+        onDragOver={(event) => { dragOverChangeList(event, section) }}
+        onDragLeave={(event) => { leaveChangeList(event, section) }}
+        onDrop={(event) => { dropOnChangeList(event, section) }}>
+        <div className={`${css.scmHeader} ${css.changeListHeader}`}>
+          <button type="button" className={css.scmDisclosure} aria-expanded={open}
+            aria-label={`${section.name} (${section.files})`} onClick={() => { toggleDir(key) }}>
+            <span className={css.chevron} data-open={open ? 'true' : undefined} aria-hidden="true">
+              <IconChevronRightOutlineRegular size={12} />
+            </span>
+            <span className={css.changeListName}>{section.name}</span>
+            {totals !== undefined && totals.files > 0 && <PlusMinus additions={totals.additions} deletions={totals.deletions} note="group" />}
+          </button>
+          {only !== undefined && (
+            <IconButton className={css.headerAction} size="sm" disabled={busy || suggesting}
+              label={only.staged ? t('unstageAll') : t('stageAll')}
+              icon={only.staged ? MINUS_ICON : <IconPlusOutlineRegular size={12} />}
+              onClick={() => { section.stage(undefined, only.staged, only.merge) }} />
+          )}
+          <span className={css.countPill} data-count={section.files}>{section.files}</span>
+        </div>
+        {open && (only !== undefined
+          ? renderTree(only.nodes, only.staged, only.merge, section)
+          : bands.map(band => renderGroup(band.id, band.label, band.rows, band.nodes, band.staged, band.merge, section)))}
       </div>
     )
   }
@@ -1129,7 +1659,7 @@ export function GitLens(props: GitLensProps) {
                 <span className={css.chevron} data-open={changesOpen ? 'true' : undefined} aria-hidden="true">
                   <IconChevronRightOutlineRegular size={12} />
                 </span>
-                {t('gitChanges')}
+                {t('commit')}
               </button>
               <div className={css.scmActions}>
                 <IconButton size="sm" icon={<IconCheckOutlineRegular size={14} />} label={t('commit')}
@@ -1193,9 +1723,13 @@ export function GitLens(props: GitLensProps) {
                 </span>
               </div>
               {clean && <Notice kind="empty">{t('changesClean')}</Notice>}
-              {renderGroup('merge', t('gitMergeChanges'), mergeEntries, mergeTree, false, true)}
-              {renderGroup('staged', t('gitStagedChanges'), stagedEntries, stagedTree, true)}
-              {renderGroup('unstaged', t('gitChanges'), unstagedEntries, unstagedTree, false)}
+              {changeListSections === null ? (
+                <>
+                  {renderGroup('merge', t('gitMergeChanges'), mergeEntries, mergeTree, false, true)}
+                  {renderGroup('staged', t('gitStagedChanges'), stagedEntries, stagedTree, true)}
+                  {renderGroup('unstaged', t('gitChanges'), unstagedEntries, unstagedTree, false)}
+                </>
+              ) : changeListSections.map(renderChangeList)}
             </div>}
           </section>
         )}

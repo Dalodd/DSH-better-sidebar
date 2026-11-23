@@ -48,6 +48,7 @@ async function mount(options: { sessionId: string; repositories?: string[] }) {
     return snapshot(scope.repoRoot ?? CWD, repositories)
   })
   vi.spyOn(api, 'gitWorktrees').mockResolvedValue([{ path: CWD, branch: 'main', current: true, changes: 0 }])
+  vi.spyOn(api, 'gitChangeLists').mockResolvedValue({ isIdeaProject: false, lists: [] })
   vi.spyOn(api, 'gitBranch').mockResolvedValue({ current: 'main', names: ['main'] })
   vi.spyOn(api, 'gitCommitModel').mockResolvedValue({ pinned: false })
   vi.spyOn(api, 'gitGraph').mockResolvedValue({

@@ -187,6 +187,9 @@ async function openGraphCommit(container: HTMLElement): Promise<void> {
 
 beforeEach(() => {
   Object.defineProperty(globalThis.navigator, 'language', { value: 'zh-CN', configurable: true })
+  // Every Git-lens refresh reads the workspace's IDEA change lists; a plain
+  // workspace answers with no named lists and keeps the staged/unstaged groups.
+  vi.spyOn(api, 'gitChangeLists').mockResolvedValue({ isIdeaProject: false, lists: [] })
 })
 
 afterEach(() => {
