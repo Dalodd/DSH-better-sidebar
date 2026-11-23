@@ -224,6 +224,16 @@
 .chevron { flex: none; display: inline-flex; color: var(--dsw-alias-label-tertiary); transition: transform 140ms var(--ds-ease-in-out); }
 .chevron[data-open='true'] { transform: rotate(90deg); }
 
+/* A file row has no disclosure control, but it still occupies the chevron's
+   12px column (the flex `gap` supplies the 6px after it). Without that column
+   a file's artwork started at the row's text edge while its parent directory's
+   folder icon sat 18px further right — at the same depth the file read as
+   left of the folder, and a nested file hung under the parent's chevron
+   instead of one indent step below it. With the column reserved, a file's
+   artwork and name line up with a directory row's at the same depth, and each
+   level below shifts exactly one 12px step (matching the guides). */
+.rowMain::before { content: ''; flex: none; width: 12px; }
+
 .dirName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--dsw-font-xxs-12); }
 
 /* One changed file: file artwork + porcelain badge + name + the trailing
