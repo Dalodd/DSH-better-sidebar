@@ -80,7 +80,7 @@ function mockGit(entries: GitStatusEntry[]): void {
   vi.spyOn(api, 'gitLog').mockResolvedValue([])
 }
 
-/** One lens tab rendered by the header's public SegmentedControl. */
+/** One lens tab rendered by the header's underline tab strip. */
 function lensTab(container: HTMLElement, label: string): HTMLButtonElement | undefined {
   return [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
     .find(tab => tab.textContent === label)
@@ -163,7 +163,7 @@ function paneOf(container: HTMLElement): HTMLElement {
 }
 
 /** The pane's OWN strip tabs. Scoped through the frame on purpose: the
- *  header's lens SegmentedControl is also a `role="tablist"`, so an unscoped
+ *  header's lens tab strip is also a `role="tablist"`, so an unscoped
  *  query would let it satisfy the assertion. */
 function paneTabs(container: HTMLElement): HTMLButtonElement[] {
   return [...paneOf(container).querySelectorAll<HTMLButtonElement>('[role="tab"]')]
@@ -195,7 +195,7 @@ afterEach(() => {
 })
 
 describe('ChangesTab', () => {
-  it('uses the public SegmentedControl with keyboard navigation, persisted lens and refresh', async () => {
+  it('renders the lens underline tabs with keyboard navigation, persisted lens and refresh', async () => {
     mockGit([])
     const ops = vi.spyOn(api, 'changesOps').mockResolvedValue({ events: [], lastSeq: 0 })
     const updateTab = vi.fn()

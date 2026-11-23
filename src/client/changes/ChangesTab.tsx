@@ -2,10 +2,13 @@
  * The unified changes tab: one tab, two lenses on "what changed?" — Git
  * (repository truth: staged/unstaged files, commit box, history) and the
  * session round (agent truth: every file the model read, wrote, or edited).
- * A 36px header carries the public SegmentedControl and the current
- * lens's refresh action; both lenses preview their selections in a shared
- * resizable bottom pane ({@link DiffPane}), and git targets expand into the
- * dedicated diff tab docked in the workbench's diff pane. The bottom pane is
+ * A 36px header carries the lens switcher — two underline tabs riding the
+ * header's own bottom edge, not the host's filled SegmentedControl (its
+ * track stacked under the sidebar's tab strip and read as one thick
+ * toolbar) — and the current lens's refresh action. Both lenses preview
+ * their selections in a shared resizable bottom pane ({@link DiffPane}), and
+ * git targets expand into the dedicated diff tab docked in the workbench's
+ * diff pane. The bottom pane is
  * ONE region with a tab strip when a Git Graph commit supplies a second view:
  * `details` (that commit's card, {@link CommitDetails}) and `diff` (the shared
  * preview). Every other preview — a worktree file, a history row, a session op
@@ -22,7 +25,7 @@
  * store owns its own poller).
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import { IconRefreshOutlineRegular, SegmentedControl } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconRefreshOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SidebarSessionEvent } from '../../context-types.ts'
 import type { TabComponentProps } from '../service.ts'
 import { t } from '../locales.ts'
@@ -56,6 +59,17 @@ export function opCountOf(sessionId: string): number | undefined {
 }
 
 type Lens = 'git' | 'graph' | 'session'
+
+/** The header switcher's views, in display order: the Git lens first, the
+ *  session round second. Each tab is `<id>-<value>` and controls the panel
+ *  `<id>-<value>-panel`, which points back with `aria-labelledby` (both panels
+ *  stay mounted and merely hide, so the link always resolves). */
+const LENS_TABS = [
+  { id: 'git', label: 'changesGitLens' },
+  { id: 'session', label: 'changesSessionLens' },
+] as const
+
+type LensTabId = (typeof LENS_TABS)[number]['id']
 
 /** The bottom pane's views: `details` (a graph commit's card, hosted while a
  *  graph selection lives), `content` (an op target's file-content view) and
@@ -212,6 +226,15 @@ export function ChangesTab({ ctx, scope, tab, visible, onOpenFile, onOpenDiff }:
     patchMeta({ lens: next })
   }
 
+  /** Switch the lens from the header strip: focus lands on the chosen tab
+   *  first (roving tabindex — the active tab is the only tab stop), then the
+   *  lens commits. Both buttons exist throughout, so the focus call is safe
+   *  before the re-render. */
+  const chooseLensTab = (next: LensTabId): void => {
+    document.getElementById(`${lensId}-${next}`)?.focus()
+    chooseLens(next)
+  }
+
   /** Preview one git change (worktree file or commit) from the Git lens. */
   const previewGit = (ref: SidebarDiffRef): void => {
     setSelection({ kind: 'git', ref })
@@ -248,16 +271,40 @@ export function ChangesTab({ ctx, scope, tab, visible, onOpenFile, onOpenDiff }:
   return (
     <div className={css.root}>
       <div className={css.head}>
-        <SegmentedControl
-          id={lensId}
-          value={lens === 'session' ? 'session' : 'git'}
-          options={[
-            { value: 'git', label: t('changesGitLens') },
-            { value: 'session', label: t('changesSessionLens') },
-          ] as const}
-          onChange={chooseLens}
-          label={t('changes')}
-        />
+        {/* Two underline tabs on the header's own bottom edge. Lighter than
+            the host SegmentedControl this replaced: no filled track, no
+            pill — just text and a 2px accent under the active label. */}
+        <div className={css.lensTabs} role="tablist" aria-label={t('changes')}>
+          {LENS_TABS.map((option, index) => {
+            const active = (lens === 'session' ? 'session' : 'git') === option.id
+            return (
+              <button
+                key={option.id}
+                id={`${lensId}-${option.id}`}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                aria-controls={`${lensId}-${option.id}-panel`}
+                tabIndex={active ? 0 : -1}
+                className={css.lensTab}
+                onClick={() => { if (!active) chooseLensTab(option.id) }}
+                onKeyDown={(event) => {
+                  let next: LensTabId | undefined
+                  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                    next = LENS_TABS[(index + 1) % LENS_TABS.length]!.id
+                  } else if (event.key === 'Home') {
+                    next = LENS_TABS[0].id
+                  } else if (event.key === 'End') {
+                    next = LENS_TABS[LENS_TABS.length - 1]!.id
+                  }
+                  if (next === undefined) return
+                  event.preventDefault()
+                  chooseLensTab(next)
+                }}
+              >{t(option.label)}</button>
+            )
+          })}
+        </div>
         {/* The Git lens refreshes from its own Changes header (#944); only the
             session lens needs the tab-level action. */}
         {lens === 'session' && <IconButton
